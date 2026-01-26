@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     
     # Security
     secret_key: str = "change-this-to-a-random-secret-key"
+
+    # Add at the end of Settings class, before class Config
+    allowed_extensions: list = [".jpg", ".jpeg", ".png", ".webp"]
     
     class Config:
         env_file = ".env"
