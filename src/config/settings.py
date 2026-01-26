@@ -3,12 +3,12 @@ from typing import Optional
 
 class Settings(BaseSettings):
     # API Settings
-    api_host: str = "0.0.0.0"
+    api_host: str = "127.0.0.1"
     api_port: int = 8000
     debug: bool = True
     
     # Database
-    database_url: str = "postgresql://user:password@localhost:5432/outfit_ai"
+    database_url: str = "postgresql://postgres:boyfromthewest@localhost:5432/outfit_ai"
     
     # File Storage
     upload_dir: str = "data/raw"
@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     device: str = "cpu"
     
     # Security
-    secret_key: str = "change-this-to-a-random-secret-key"
+    secret_key: str = "boy-from-the-west"
 
     # Add at the end of Settings class, before class Config
     allowed_extensions: list = [".jpg", ".jpeg", ".png", ".webp"]
