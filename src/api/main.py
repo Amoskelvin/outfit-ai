@@ -4,7 +4,7 @@ from src.config.settings import settings
 from src.api.routes import upload
 from src.database.connection import engine
 from sqlalchemy import text
-from src.api.routes import wardrobe
+from src.api.routes import wardrobe, analysis
 
 # Create FastAPI app
 app = FastAPI(
@@ -36,6 +36,7 @@ async def startup():
 # Include routers
 app.include_router(upload.router)
 app.include_router(wardrobe.router)
+app.include_router(analysis.router)
 
 # Root endpoint
 @app.get("/")
