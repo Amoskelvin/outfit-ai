@@ -22,11 +22,20 @@ class WardrobeItemBase(BaseModel):
     category: str
     subcategory: Optional[str] = None
     dominant_color: Optional[str] = None
+    color_palette: Optional[dict] = None 
     pattern: Optional[str] = None
     formality: Optional[str] = None
     season: Optional[str] = None
     brand: Optional[str] = None
     notes: Optional[str] = None
+    sleeve_length: Optional[str] = None
+    neckline: Optional[str] = None
+    has_logo: Optional[int] = 0        
+    detected_text: Optional[dict] = None 
+    texture: Optional[str] = None
+    closure_type: Optional[str] = None
+    fit: Optional[str] = None
+    length: Optional[str] = None
 
 class WardrobeItemCreate(WardrobeItemBase):
     pass

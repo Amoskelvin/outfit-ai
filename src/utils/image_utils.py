@@ -22,6 +22,26 @@ class ImageProcessor:
         return cv2.resize(image, target_size)
     
     @staticmethod
+    def apply_white_balance(image: np.ndarray) -> np.ndarray:
+        """
+        Corrects color cast (e.g., yellow bedroom lights) using 'Gray World' assumption.
+        Makes white shirts actually look white.
+        """
+        result = image.copy()
+        # Convert to LAB color space (separates lightness from color)
+        result = cv2.cvtColor(result, cv2.COLOR_RGB2LAB)
+        
+        avg_a = np.mean(result[:, :, 1])
+        avg_b = np.mean(result[:, :, 2])
+        
+        # Shift the color channels (A and B) to be centered around 128 (neutral gray)
+        result[:, :, 1] = result[:, :, 1] - ((avg_a - 128) * (result[:, :, 0] / 255.0) * 1.1)
+        result[:, :, 2] = result[:, :, 2] - ((avg_b - 128) * (result[:, :, 0] / 255.0) * 1.1)
+        
+        result = cv2.cvtColor(result, cv2.COLOR_LAB2RGB)
+        return result
+        
+    @staticmethod
     def remove_background(image: np.ndarray, method: str = "grabcut") -> Tuple[np.ndarray, np.ndarray]:
         """
         Advanced background removal using GrabCut algorithm
@@ -183,25 +203,67 @@ class ImageProcessor:
         # Convert to grayscale for pattern analysis
         gray = cv2.cvtColor(image_to_analyze, cv2.COLOR_RGB2GRAY)
 
-        # NEW: Blur slightly to ignore fabric texture (denim/linen threads)
-        # but keep actual print patterns
+        # Blur the SPATIAL image to suppress fabric-weave noise while keeping print edges.
+        # The old approach (reshape masked pixels → random square → blur) destroyed spatial
+        # structure: blurring randomly-arranged pixels acts like sample-averaging, collapsing
+        # std_dev from ~50 (real graphic tee) to ~10 → false "solid" on dark garments.
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # Calculate edge density on the BLURRED image
+
+        # Extract masked pixels for pixel-distribution statistics
+        if mask is not None:
+            gray_masked = gray[mask > 0]
+            if len(gray_masked) == 0:
+                return "solid"
+        else:
+            gray_masked = gray.ravel()
+
+        # std_dev from raw pixel distribution (not blurred random square)
+        std_dev = np.std(gray_masked)
+
+        # Edge density from the spatially-correct blurred image
         edges = cv2.Canny(blurred, 50, 150)
-    
-        # Remove background (black pixels from mask)
         if mask is not None:
-            gray = gray[mask > 0]
-    
-        # Calculate standard deviation of pixel intensities
-        std_dev = np.std(gray)
-    
-        # Calculate edge density
-        edges = cv2.Canny(image_to_analyze, 50, 150)
+            edge_density = np.sum(edges[mask > 0] > 0) / max(np.sum(mask > 0), 1)
+        else:
+            edge_density = np.sum(edges > 0) / max(edges.size, 1)
+
+        # Stripe check on the original spatial layout. Repeated horizontal/vertical
+        # bands create strong row/column intensity oscillations; graphic prints tend to
+        # be localized and less regular across the full garment.
+        try:
+            spatial_gray = cv2.cvtColor(image_to_analyze, cv2.COLOR_RGB2GRAY)
+            if mask is not None:
+                row_counts = np.sum(mask > 0, axis=1)
+                col_counts = np.sum(mask > 0, axis=0)
+                min_row_coverage = max(int(np.max(row_counts) * 0.45), 1)
+                min_col_coverage = max(int(np.max(col_counts) * 0.45), 1)
+                valid_rows = row_counts >= min_row_coverage
+                valid_cols = col_counts >= min_col_coverage
+
+                row_sum = np.sum(spatial_gray * (mask > 0), axis=1)
+                col_sum = np.sum(spatial_gray * (mask > 0), axis=0)
+                row_signal = row_sum[valid_rows] / np.maximum(row_counts[valid_rows], 1)
+                col_signal = col_sum[valid_cols] / np.maximum(col_counts[valid_cols], 1)
+            else:
+                row_signal = np.mean(spatial_gray, axis=1)
+                col_signal = np.mean(spatial_gray, axis=0)
+
+            row_diff = np.diff(cv2.GaussianBlur(row_signal.reshape(-1, 1), (1, 5), 0).ravel())
+            col_diff = np.diff(cv2.GaussianBlur(col_signal.reshape(-1, 1), (1, 5), 0).ravel())
+            row_crossings = np.sum(np.diff(np.sign(row_diff)) != 0)
+            col_crossings = np.sum(np.diff(np.sign(col_diff)) != 0)
+
+            if (
+                (len(row_signal) > 20 and np.std(row_diff) > 5 and row_crossings >= 8)
+                or (len(col_signal) > 20 and np.std(col_diff) > 5 and col_crossings >= 8)
+            ):
+                return "striped"
+        except Exception:
+            pass
+
+        # Keep gray as flat masked pixels for the FFT stripe check below
         if mask is not None:
-            edges = edges[mask > 0]
-        edge_density = np.sum(edges > 0) / max(len(edges), 1)
+            gray = gray_masked
     
         # Detect patterns based on variation
         if std_dev < 20 and edge_density < 0.05:
@@ -223,7 +285,10 @@ class ImageProcessor:
                 pass
         
             return "printed"
-        elif std_dev > 30:
+        elif std_dev > 20:
+            # Catches the gap zone (std_dev 20–30, edge_density 5–15%) that the old
+            # threshold of 30 silently returned "solid" for — e.g. a black tee with
+            # thin contour-line graphics: raw std_dev ~25, edges ~8% → patterned.
             return "patterned"
         else:
             return "solid"
@@ -248,269 +313,309 @@ class ImageProcessor:
             }
     
         # HSV analysis
-        hsv_pixels = np.array([colorsys.rgb_to_hsv(r/255, g/255, b/255) 
+        hsv_pixels = np.array([colorsys.rgb_to_hsv(r/255, g/255, b/255)
                                for r, g, b in pixels])
-    
-        # Hue variance
-        hue_variance = np.var(hsv_pixels[:, 0]) * 360
-    
+
+        # Hue variance — only on chromatic (visually saturated) pixels.
+        # Near-achromatic pixels (black, white, grey, heather) have mathematically
+        # undefined hue: tiny RGB differences from compression/texture noise cause
+        # colorsys to return random hue values (e.g. (28,30,35) → h=210°).
+        # Using all pixels therefore produces false high variance on solid garments.
+        # Filter: s ≥ 0.20 AND v ≥ 0.20 selects genuinely chromatic pixels while
+        # excluding near-black shadows (v<0.20) and near-white highlights (s<0.20).
+        chromatic_mask = (hsv_pixels[:, 1] >= 0.20) & (hsv_pixels[:, 2] >= 0.25)
+        n_chromatic = int(np.sum(chromatic_mask))
+        n_total = len(hsv_pixels)
+
+        if n_chromatic >= 50:
+            hue_variance = float(np.var(hsv_pixels[chromatic_mask, 0]) * 360)
+            # Structural two-tone: one chromatic color zone + a large achromatic base
+            # (e.g. contrast-collar polo: dark green trim + white body).
+            # Hue variance alone is near-zero (only one hue family) yet the garment
+            # is visually multi-colored. Detect via pixel-count ratios.
+            n_achromatic = int(np.sum(hsv_pixels[:, 1] < 0.10))
+            is_two_tone = (
+                n_chromatic > n_total * 0.08   # trim covers ≥8 % of garment
+                and n_achromatic > n_total * 0.25  # base is largely achromatic
+            )
+            has_multiple_colors = hue_variance > 0.15 or is_two_tone
+        else:
+            # All pixels are achromatic — garment is solid regardless of value spread.
+            hue_variance = 0.0
+            has_multiple_colors = False
+
         # Contrast detection: Check for both very dark and very light pixels
-        value_range = np.max(hsv_pixels[:, 2]) - np.min(hsv_pixels[:, 2])
-        has_dark = np.any(hsv_pixels[:, 2] < 0.25)
-        has_light = np.any(hsv_pixels[:, 2] > 0.80)
-    
+        value_range = float(np.max(hsv_pixels[:, 2]) - np.min(hsv_pixels[:, 2]))
+        has_dark = bool(np.any(hsv_pixels[:, 2] < 0.25))
+        has_light = bool(np.any(hsv_pixels[:, 2] > 0.80))
+
         return {
-            "has_multiple_colors": hue_variance > 0.15,
+            "has_multiple_colors": has_multiple_colors,
             "has_high_contrast": (has_dark and has_light) or value_range > 0.6,
-            "color_variance": float(hue_variance),
+            "color_variance": hue_variance,
             "average_saturation": float(np.mean(hsv_pixels[:, 1])),
-            "is_vibrant": np.mean(hsv_pixels[:, 1]) > 0.3,
-            "value_range": float(value_range)
+            "is_vibrant": bool(np.mean(hsv_pixels[:, 1]) > 0.3),
+            "value_range": value_range,
         }
     
     @staticmethod
-    def detect_print_style(pattern: str, color_palette: Dict) -> str:
+    def detect_print_style(pattern: str, color_palette: Dict, texture: str = None) -> str:
         """
         Detect specific print styles based on pattern and colors
         """
-        if pattern != "printed":
-            return pattern
-    
-        colors = [c["name"] for c in color_palette.get("colors", [])]
-    
-        # Tropical/fruit print detection
-        has_bright_colors = any(c in colors for c in ["bright orange", "orange", "yellow", "bright yellow"])
-        has_green = any("green" in c for c in colors)
-        has_dark_bg = any(c in colors for c in ["navy", "midnight blue", "black"])
-    
-        if has_bright_colors and has_green and has_dark_bg:
-            return "tropical print"
-    
-        # Other print patterns can be added here
-        return "printed"
-    
-    @staticmethod
-    def detect_print_style(pattern: str, color_palette: Dict) -> str:
-        """
-        Detect specific print styles based on pattern and colors
-        """
+        if texture and "embroid" in texture.lower():
+            return "embroidered"
         if pattern not in ["printed", "patterned"]:
             return pattern
     
         colors = [c["name"] for c in color_palette.get("colors", [])]
-    
-        # Patchwork detection: Multiple colors + high contrast (black/white present)
+
         has_black = any(c in colors for c in ["black", "charcoal", "dark gray"])
-        has_white = any(c in colors for c in ["white", "light gray"])
-        has_multiple_hues = len(set(colors)) >= 3
-    
+        has_white = any(c in colors for c in ["white", "off-white", "light gray", "silver",
+                                               "heather grey"])
+
+        # has_dark_base: the SHIRT BODY is black/charcoal — the dark canvas of a graphic tee.
+        # Must NOT match "dark green", "dark red" etc. — those are accent/trim colors, not a
+        # dark body. Use an explicit set so "dark" substring can't cause false positives.
+        _dark_base_names = {"black", "charcoal", "charcoal gray", "dark gray"}
+        has_dark_base = any(c in _dark_base_names for c in colors)
+
+        # has_multiple_hues: a graphic print needs 2+ distinct CHROMATIC (saturated) colors.
+        # Counting "off-white" + "light gray" + "dark green" as 3 unique strings incorrectly
+        # fires for a two-tone polo where the achromatic white body plus one trim color are
+        # just structural design — not a multi-color artwork print.
+        _achromatic = {
+            "white", "off-white", "light gray", "light grey", "gray", "grey",
+            "heather grey", "heather gray", "silver", "dark gray", "dark grey",
+            "charcoal", "charcoal gray", "black"
+        }
+        _chromatic_colors = {c for c in colors if c not in _achromatic}
+        has_multiple_hues = len(_chromatic_colors) >= 2
+
+        # Tropical/fruit print detection (specific — must stay before generic graphic-print)
+        has_bright_colors = any(c in colors for c in [
+            "bright orange", "orange", "yellow", "bright yellow",
+            "bright red", "hot pink", "coral", "mustard"])
+        has_green = any("green" in c or "teal" in c for c in colors)
+        has_dark_bg = any(c in colors for c in ["navy", "midnight blue", "black"])
+
+        if has_bright_colors and has_green and has_dark_bg:
+            return "tropical print"
+
+        # Floral print: flower-family colors + greens (specific — stays before graphic-print)
+        has_flower_colors = any(
+            kw in c for c in colors
+            for kw in ("pink", "coral", "peach", "rose", "lavender", "purple", "violet", "lilac")
+        )
+        has_green_leaves = any("green" in c or "teal" in c for c in colors)
+        if has_white and has_flower_colors and has_green_leaves:
+            return "floral print"
+
+        # Graphic print: single fabric with printed design — dark or light base colour plus
+        # at least one accent colour.  Checked BEFORE patchwork because graphic prints with
+        # multi-colour illustrations (zombie, graffiti, etc.) always have a dominant base
+        # (black or white/off-white shirt) that distinguishes them from true patchwork.
+        # No colour-count cap: real graphic prints can have 5+ colours in the artwork.
+        if (has_dark_base or has_white) and has_multiple_hues:
+            return "graphic print"
+
+        # Patchwork: sewn-together fabric pieces — only fires when there is NO clear single
+        # dominant base colour (no black, no white/off-white), forcing multiple colours to
+        # sit at roughly equal weight.
         if has_black and has_white and has_multiple_hues:
-            # Check if there's a dominant color family with contrasts
             reds = sum(1 for c in colors if "red" in c or "maroon" in c or "burgundy" in c)
             if reds >= 2:
                 return "bandana patchwork"
             else:
                 return "patchwork"
-    
-        # Tropical/fruit print detection
-        has_bright_colors = any(c in colors for c in [
-            "bright orange", "orange", "yellow", "bright yellow", 
-            "bright red", "hot pink", "coral"
-        ])
-        has_green = any("green" in c for c in colors)
-        has_dark_bg = any(c in colors for c in ["navy", "midnight blue", "black"])
-    
-        if has_bright_colors and has_green and has_dark_bg:
-            return "tropical print"
-    
+
+        # Only one chromatic color (e.g. dark green trim on a white polo) → the color
+        # variation is structural (collar, cuffs, band), not a scattered print artwork.
+        if len(_chromatic_colors) <= 1:
+            return "colorblock"
+
         return "printed"
-    
-    @staticmethod
-    def apply_white_balance(image: np.ndarray) -> np.ndarray:
-        """
-        Corrects color cast (e.g., yellow bedroom lights) using 'Gray World' assumption.
-        Makes white shirts actually look white.
-        """
-        result = image.copy()
-        # Convert to LAB color space (separates lightness from color)
-        result = cv2.cvtColor(result, cv2.COLOR_RGB2LAB)
-        
-        avg_a = np.mean(result[:, :, 1])
-        avg_b = np.mean(result[:, :, 2])
-        
-        # Shift the color channels (A and B) to be centered around 128 (neutral gray)
-        result[:, :, 1] = result[:, :, 1] - ((avg_a - 128) * (result[:, :, 0] / 255.0) * 1.1)
-        result[:, :, 2] = result[:, :, 2] - ((avg_b - 128) * (result[:, :, 0] / 255.0) * 1.1)
-        
-        result = cv2.cvtColor(result, cv2.COLOR_LAB2RGB)
-        return result
 
 class ColorExtractor:
     """Extract dominant colors from images"""
     
     @staticmethod
     def extract_dominant_colors(image: np.ndarray, n_colors: int = 5, use_mask: bool = True, mask: np.ndarray = None, return_counts: bool = False) -> List[Tuple[int, int, int]]:
-        """
-        Advanced color extraction with multi-stage analysis for complex patterns
-        """ 
         from sklearn.cluster import KMeans
         
-        # Get pixels
-        if use_mask and mask is not None:
-            foreground_pixels = image[mask > 0]
-            if len(foreground_pixels) < n_colors:
-                pixels = image.reshape(-1, 3)
+        # 1. INPUT HANDLING
+        if image.ndim == 3:
+            if use_mask and mask is not None and mask.shape[:2] == image.shape[:2]:
+                foreground_pixels = image[mask > 0]
+                pixels = foreground_pixels if len(foreground_pixels) > n_colors else image.reshape(-1, 3)
             else:
-                pixels = foreground_pixels
+                pixels = image.reshape(-1, 3)
         else:
-            pixels = image.reshape(-1, 3)
-    
-        # Basic filtering
-        non_extreme_mask = (np.sum(pixels, axis=1) < 750) & (np.sum(pixels, axis=1) > 10)
-        filtered_pixels = pixels[non_extreme_mask]
-    
-        if len(filtered_pixels) < 100:
-            filtered_pixels = pixels
-    
-        # === STAGE 1: Detect High-Contrast Elements (Black/White/Gray) ===
+            pixels = image
+
+        # 2. BASIC FILTERING
+        if len(pixels) > 100:
+            pixels = pixels[np.sum(pixels, axis=1) > 10]
+        
+        current_pixels = pixels
+
+        # 3. ZEBRA FIX (Contrast Snapping)
+        pixel_sums = np.sum(current_pixels, axis=1)
+        has_deep_black = np.sum(pixel_sums < 150) > len(current_pixels) * 0.05
+        has_pure_white = np.sum(pixel_sums > 600) > len(current_pixels) * 0.05
+        
+        if has_deep_black and has_pure_white:
+            # Zebra Fix: purge achromatic mid-tone ghost pixels (anti-aliasing artifacts
+            # between black and white stripes).  The original check deleted ALL pixels with
+            # sum 150–600, which silently removed chromatic graphic colours (green zombie
+            # face, yellow text, pink logo) whose RGB sums fall in the same range.
+            # Fix: only delete mid-range pixels with LOW saturation (true gray artifacts).
+            # Colorful pixels in that luminance band are real design elements — keep them.
+            is_mid_range = (pixel_sums >= 150) & (pixel_sums <= 600)
+            if np.any(is_mid_range):
+                mid_pixels = current_pixels[is_mid_range]
+                hsv_mid = np.array([colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+                                    for r, g, b in mid_pixels])
+                is_achromatic_mid = hsv_mid[:, 1] < 0.20  # saturation < 20% → gray artifact
+                # Rebuild the keep mask: keep if NOT (mid-range AND achromatic)
+                mid_indices = np.where(is_mid_range)[0]
+                drop = np.zeros(len(current_pixels), dtype=bool)
+                drop[mid_indices[is_achromatic_mid]] = True
+                current_pixels = current_pixels[~drop]
+
+            if len(current_pixels) < 50:
+                current_pixels = pixels
+
+        # 4. RECALCULATE MASKS (Crucial for avoiding the broadcast error)
+        pixel_sums = np.sum(current_pixels, axis=1)
+        
+        black_mask = pixel_sums < 150
+        white_mask = pixel_sums > 600
+        
+        hsv_pixels = np.array([colorsys.rgb_to_hsv(r/255, g/255, b/255) for r, g, b in current_pixels])
+
+        # Gray Mask (Only if not striped)
+        if has_deep_black and has_pure_white:
+            gray_mask = np.zeros(len(current_pixels), dtype=bool)
+        else:
+            gray_mask = (hsv_pixels[:, 1] < 0.15) & (hsv_pixels[:, 2] > 0.20) & (hsv_pixels[:, 2] < 0.80)
+
+        # Yellow Mask
+        yellow_mask = (hsv_pixels[:, 0] > 0.12) & (hsv_pixels[:, 0] < 0.18) & \
+                      (hsv_pixels[:, 1] > 0.3) & (hsv_pixels[:, 2] > 0.70)
+        
+        # Silver Mask (Restored!)
+        silver_mask = (hsv_pixels[:, 1] < 0.20) & (hsv_pixels[:, 2] > 0.55) & (hsv_pixels[:, 2] < 0.88)
+
+        # 5. STAGE 1: Extract High-Contrast Colors
         contrast_colors = []
         contrast_counts = []
-    
-        # Detect BLACK (deep charcoal, black panels)
-        black_mask = np.sum(filtered_pixels, axis=1) < 60  # Very dark
-        if np.sum(black_mask) > len(filtered_pixels) * 0.05:  # If >5% of image
-            black_pixels = filtered_pixels[black_mask]
-            avg_black = np.mean(black_pixels, axis=0).astype(int)
+
+        # Add Black
+        if np.sum(black_mask) > len(current_pixels) * 0.05:
+            avg_black = np.mean(current_pixels[black_mask], axis=0).astype(int)
             contrast_colors.append(tuple(avg_black))
             contrast_counts.append(np.sum(black_mask))
-    
-        # Detect WHITE (line work, details, accents)
-        white_mask = np.sum(filtered_pixels, axis=1) > 600  # Very light
-        if np.sum(white_mask) > len(filtered_pixels) * 0.015:  # If >3% of image
-            white_pixels = filtered_pixels[white_mask]
-            avg_white = np.mean(white_pixels, axis=0).astype(int)
+
+        # Add White
+        white_count = np.sum(white_mask)
+        avg_white = None
+        if white_count > len(current_pixels) * 0.005:
+            avg_white = np.mean(current_pixels[white_mask], axis=0).astype(int)
             contrast_colors.append(tuple(avg_white))
-            contrast_counts.append(np.sum(white_mask) * 2.0)
-    
-        # Detect GRAY (if present)
-        hsv_pixels = np.array([colorsys.rgb_to_hsv(r/255, g/255, b/255) 
-                               for r, g, b in filtered_pixels])
-        gray_mask = (hsv_pixels[:, 1] < 0.15) & (hsv_pixels[:, 2] > 0.20) & (hsv_pixels[:, 2] < 0.80)
-        if np.sum(gray_mask) > len(filtered_pixels) * 0.05:
-            gray_pixels = filtered_pixels[gray_mask]
-            avg_gray = np.mean(gray_pixels, axis=0).astype(int)
+            contrast_counts.append(int(white_count * 5.0))
+
+        # Add Silver (Restored!)
+        silver_count = np.sum(silver_mask)
+        if silver_count > len(current_pixels) * 0.01:
+            avg_silver = np.mean(current_pixels[silver_mask], axis=0).astype(int)
+            
+            # Only add silver if it's distinct from white
+            is_distinct = True
+            if avg_white is not None:
+                diff = np.sum(np.abs(avg_silver - avg_white))
+                if diff < 40: is_distinct = False
+            
+            if is_distinct:
+                contrast_colors.append(tuple(avg_silver))
+                contrast_counts.append(int(silver_count * 3.0))
+
+        # Add Gray
+        if np.sum(gray_mask) > len(current_pixels) * 0.05:
+            avg_gray = np.mean(current_pixels[gray_mask], axis=0).astype(int)
             contrast_colors.append(tuple(avg_gray))
             contrast_counts.append(np.sum(gray_mask))
-
-        # === STAGE 1.5: Detect BRIGHT YELLOWS/CREAMS (often missed) ===
-        hsv_filtered = np.array([colorsys.rgb_to_hsv(r/255, g/255, b/255) 
-                        for r, g, b in filtered_pixels])
-
-        # Detect bright yellows (peach interiors!)
-        yellow_mask = (hsv_filtered[:, 0] > 0.12) & (hsv_filtered[:, 0] < 0.18) & \
-                      (hsv_filtered[:, 1] > 0.3) & (hsv_filtered[:, 2] > 0.70)
-        if np.sum(yellow_mask) > len(filtered_pixels) * 0.03:
-            yellow_pixels = filtered_pixels[yellow_mask]
-            avg_yellow = np.mean(yellow_pixels, axis=0).astype(int)
+            
+        # Add Yellow
+        if np.sum(yellow_mask) > len(current_pixels) * 0.02:
+            avg_yellow = np.mean(current_pixels[yellow_mask], axis=0).astype(int)
             contrast_colors.append(tuple(avg_yellow))
-            contrast_counts.append(np.sum(yellow_mask) * 1.5)  # Boost yellow visibility
-    
-        # === STAGE 2: Extract Chromatic Colors (Reds, Blues, Greens, etc.) ===
-        # Remove the contrast colors we already found
-        chromatic_mask = ~(black_mask | white_mask | gray_mask | yellow_mask)
-        chromatic_pixels = filtered_pixels[chromatic_mask]
-    
-        if len(chromatic_pixels) < 50:
-            chromatic_pixels = filtered_pixels
+            contrast_counts.append(np.sum(yellow_mask) * 2.0)
+
+        # 6. STAGE 2: Extract Chromatic Colors
+        # Exclude all special masks
+        chromatic_mask = ~(black_mask | white_mask | gray_mask | yellow_mask | silver_mask)
+        chromatic_pixels = current_pixels[chromatic_mask]
 
         if len(chromatic_pixels) < 10:
             final_colors = contrast_colors[:n_colors]
-            final_counts = contrast_counts[:n_colors]
+            # Handle return format based on flag
             if return_counts:
-                return final_colors, final_counts
+                 # Need to match counts to colors roughly if returning early
+                 return final_colors, contrast_counts[:len(final_colors)]
             return final_colors
 
-        # Convert to HSV for intelligent weighting
-        hsv_chromatic = np.array([colorsys.rgb_to_hsv(r/255, g/255, b/255) 
-                                  for r, g, b in chromatic_pixels])
-    
-        # === AGGRESSIVE WEIGHTING ===
-        saturation = hsv_chromatic[:, 1]
-        value = hsv_chromatic[:, 2]
-    
+        # Weighting
+        hsv_chromatic = hsv_pixels[chromatic_mask]
         weights = np.ones(len(chromatic_pixels))
-    
-        # Super boost for vibrant, saturated colors
-        vibrant_mask = (saturation > 0.5) & (value > 0.4)
-        weights[vibrant_mask] *= 6.0
-    
-        # Boost for saturated colors
-        saturated_mask = (saturation > 0.35) & (value > 0.25)
-        weights[saturated_mask] *= 3.0
-    
-        # Penalty for dark colors (but not too harsh, we want colored darks)
-        dark_mask = value < 0.25
-        weights[dark_mask] *= 0.5
-
-        # === OPTIMIZATION: Sample pixels if too many ===
-        if len(chromatic_pixels) > 5000:
-            # Randomly sample 5000 pixels (much faster, still accurate)
-            sample_indices = np.random.choice(len(chromatic_pixels), 5000, replace=False)
-            chromatic_pixels_sampled = chromatic_pixels[sample_indices]
-            weights_sampled = weights[sample_indices]
-        else:
-            chromatic_pixels_sampled = chromatic_pixels
-            weights_sampled = weights
-    
-        # === STAGE 3: K-Means Clustering on Chromatic Colors ===
-        # Calculate how many chromatic colors we need
-        n_chromatic = max(2, n_colors - len(contrast_colors))
-        n_clusters = min(n_chromatic + 5, len(chromatic_pixels_sampled))
-
-        chromatic_colors = []
-        chromatic_counts_sorted=[]
-    
-        if n_clusters >= 2:
-            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-            labels = kmeans.fit_predict(chromatic_pixels_sampled)
-            colors = kmeans.cluster_centers_.astype(int)
         
-            # Weighted counts
+        hue = hsv_chromatic[:, 0]
+        sat = hsv_chromatic[:, 1]
+        val = hsv_chromatic[:, 2]
+
+        weights[(sat > 0.5) & (val > 0.4)] *= 6.0
+        weights[(sat > 0.35) & (val > 0.25)] *= 3.0
+        
+        # Cool Color Boost
+        cool_mask = (hue > 0.35) & (hue < 0.75) & (sat > 0.2)
+        weights[cool_mask] *= 2.5
+
+        # Sampling
+        if len(chromatic_pixels) > 5000:
+            indices = np.random.choice(len(chromatic_pixels), 5000, replace=False)
+            sample_pixels = chromatic_pixels[indices]
+            sample_weights = weights[indices]
+        else:
+            sample_pixels = chromatic_pixels
+            sample_weights = weights
+
+        # 7. STAGE 3: K-Means
+        n_chromatic = max(2, n_colors - len(contrast_colors))
+        n_clusters = min(n_chromatic + 3, len(sample_pixels))
+        
+        if n_clusters >= 1:
+            kmeans = KMeans(n_clusters=n_clusters, n_init=5)
+            kmeans.fit(sample_pixels, sample_weight=sample_weights)
+            
+            centers = kmeans.cluster_centers_.astype(int)
+            labels = kmeans.labels_
+            
             chromatic_counts = []
             for i in range(n_clusters):
-                cluster_mask = labels == i
-                cluster_weight = np.sum(weights_sampled[cluster_mask])
-                chromatic_counts.append(cluster_weight)
-        
-            # Get top chromatic colors
-            sorted_indices = np.argsort(-np.array(chromatic_counts))[:n_chromatic]
-            chromatic_colors = [tuple(colors[i]) for i in sorted_indices]
-            chromatic_counts_sorted = [int(chromatic_counts[i]) for i in sorted_indices]
-    
-        # === STAGE 4: Combine Contrast + Chromatic Colors ===
-        # Strategy: Interleave them based on visual importance
-        all_colors = []
-        all_counts = []
-    
-        # Add most dominant chromatic color first (the main color family)
-        if chromatic_colors:
-            all_colors.append(chromatic_colors[0])
-            all_counts.append(chromatic_counts_sorted[0])
-    
-        # Add contrast colors (black/white are visually important)
-        for i, color in enumerate(contrast_colors):
-            all_colors.append(color)
-            all_counts.append(contrast_counts[i])
-    
-        # Add remaining chromatic colors
-        for i in range(1, len(chromatic_colors)):
-            all_colors.append(chromatic_colors[i])
-            all_counts.append(chromatic_counts_sorted[i])
-    
-        # Return top n_colors
-        final_colors = all_colors[:n_colors]
-        final_counts = all_counts[:n_colors]
-    
+                chromatic_counts.append(np.sum(sample_weights[labels == i]))
+            
+            sorted_idx = np.argsort(-np.array(chromatic_counts))[:n_chromatic]
+            
+            # Combine everything
+            for i in sorted_idx:
+                contrast_colors.append(tuple(centers[i]))
+                contrast_counts.append(int(chromatic_counts[i]))
+
+        # Final Sort
+        final_pairs = sorted(zip(contrast_colors, contrast_counts), key=lambda x: x[1], reverse=True)
+        final_colors = [p[0] for p in final_pairs[:n_colors]]
+        final_counts = [p[1] for p in final_pairs[:n_colors]]
+
         if return_counts:
             return final_colors, final_counts
         return final_colors
@@ -524,23 +629,60 @@ class ColorExtractor:
         h, s, v = colorsys.rgb_to_hsv(r/255, g/255, b/255)
         h = h * 360  # Convert to degrees
     
-        # === PURE WHITE/BLACK/GRAY (very strict) ===
-        if v > 0.90 and s < 0.10:
+       # === PURE WHITE/BLACK/GRAY (very strict) ===
+        if v > 0.90 and s < 0.08:
             return "white"
-    
+
+        # Off-white / cream white
+        if v > 0.85 and s < 0.15:
+            return "off-white"
+
+        # Light gray (includes light heather grey range)
+        if v > 0.65 and s < 0.15:
+            return "light gray"
+
+        # Heather grey: slight desaturated hue typical of fleece/cotton blends
+        # (v 0.48-0.65, very low saturation — not quite "gray", not quite "light gray")
+        if 0.48 <= v <= 0.65 and s < 0.15:
+            return "heather grey"
+
+        # BLACK vs DARK BLUE (CRITICAL FIX!)
         if v < 0.15:
-            return "black"
+            # Below v=0.10 the hue is imperceptible — always black regardless of saturation.
+            # Above that, require meaningful saturation (>0.25) to call something "midnight blue".
+            if v >= 0.10 and s > 0.25 and 200 < h < 260:
+                return "midnight blue"  # Dark blue, not black
+            else:
+                return "black"
+
+        # CHARCOAL vs NAVY (for medium-dark colors)
+        if v < 0.25:
+            # Check hue for blue tones (navy starts at 205 to avoid teal-green overlap)
+            if s > 0.20 and 205 < h < 260:
+                return "navy"
+            elif s < 0.10:
+                return "charcoal"
+            else:
+                if h < 15 or h >= 330:
+                    return "dark red"
+                elif h < 60:  # h 15-60°: orange-brown range (chocolate, dark brown)
+                    return "brown"
+                elif h < 200:
+                    return "dark green"
+                elif h < 265:
+                    return "midnight blue"
+                else:
+                    return "dark purple"
     
-        # Gray (low saturation across all brightness levels)
+        # Pure grey scale (very low saturation — reaches here only when v < 0.48,
+        # since light gray catches v > 0.65 and heather grey catches v 0.48–0.65)
         if s < 0.10:
             if v < 0.30:
                 return "charcoal"
-            elif v < 0.50:
+            elif v < 0.42:
                 return "dark gray"
-            elif v < 0.70:
+            else:
                 return "gray"
-            else:   
-                return "light gray"
     
         # === DESATURATED COLORS (pastels, muted tones) ===
         if s < 0.25:
@@ -562,20 +704,24 @@ class ColorExtractor:
                     return "dusty rose"
                 elif h < 90:
                     return "tan"
-                elif h < 210:
+                elif h < 165:
                     return "slate blue"
+                elif h < 210:
+                    return "teal"
+                elif h < 260:
+                    return "slate blue"  # dark desaturated blue — was wrongly "mauve"
                 else:
                     return "mauve"
     
         # === DARK COLORS (low value, high saturation) ===
         if v < 0.30:
-            if h < 30 or h >= 330:
+            if h < 15 or h >= 330:
                 return "dark red"
-            elif h < 60:
+            elif h < 60:  # h 15-60°: dark orange-brown (chocolate, dark brown, rust)
                 return "brown"
-            elif h < 150:
+            elif h < 200:  # extended from 150 — captures dark teal-green (h≈150-200)
                 return "dark green"
-            elif h < 240:
+            elif h < 265:
                 return "midnight blue"
             else:
                 return "dark purple"
@@ -589,7 +735,7 @@ class ColorExtractor:
             elif h < 80:
                 return "olive"
             elif h < 160:
-                return "forest green"  # THIS FIXES THE GREEN->NAVY BUG
+                return "forest green"  
             elif h < 200:
                 return "teal"
             elif h < 250:
@@ -609,37 +755,64 @@ class ColorExtractor:
     
         # ORANGE FAMILY
         elif h < 20:
-            if s > 0.50 and v > 0.60:
-                return "coral"  # For salmon/terracotta
+            if s < 0.30:  # Low saturation = brown, not coral
+                if v > 0.40:
+                    return "brown"
+                else:
+                    return "dark brown"
+            elif s > 0.50 and v > 0.60:
+                return "coral"
             else:
                 return "red-orange"
-        elif h < 35:
-            if s > 0.70:
+        elif h < 40:
+            # Check if it's brown/tan first (low saturation)
+            if s < 0.35 and v > 0.35:
+                if v > 0.55:
+                    return "tan"  # Light brown
+                elif v > 0.35:
+                    return "brown"
+                else:
+                    return "dark brown"
+            
+            elif s > 0.40:
+                if v > 0.65:
+                    return "rust"  # Bright rust/copper
+                elif v > 0.45:
+                    return "terracotta"  # Medium rust
+                else:
+                    return "burnt orange"  # Dark rust
+            # Then check for orange variants
+            elif s > 0.70 and v > 0.65:
                 return "bright orange"
-            elif s > 0.40 and v > 0.50:
-                return "peach"  # Add peach color!
+            elif s > 0.40 and v > 0.70:
+                return "peach"  # True peach - high value, medium sat
+            elif s > 0.40 and v > 0.40 and v < 0.65:
+                return "camel"  # NEW: Camel/wheat color!
             else:
                 return "orange"
-        elif h < 45:
-            if v > 0.70:
-                return "orange"
-            else:
-                return "terracotta"  # Add terracotta!
     
         # YELLOW FAMILY
         elif h < 50:
-            return "orange-yellow"
-        elif h < 60:
+            if s > 0.50 and v > 0.40 and v < 0.70:
+                return "mustard"  # Deep yellow-brown (like your jacket!)
+            else:
+                return "orange-yellow"
+        elif h < 65:
             if s < 0.40 and v > 0.80:
                 return "cream"
+            elif s > 0.50 and v > 0.40 and v < 0.65:
+                return "mustard"  # Second chance for mustard
             elif v > 0.85:
                 return "bright yellow"
             elif v > 0.70:
                 return "yellow"
             else:
-                return "mustard"
+                return "ochre"  # Dark yellow-brown
         elif h < 80:
-            return "yellow-green"
+            if s > 0.30 and v > 0.35 and v < 0.60:
+                return "olive"
+            else:
+                return "yellow-green"
     
         # GREEN FAMILY
         elif h < 100:
@@ -717,6 +890,8 @@ class ColorExtractor:
         colors, counts = ColorExtractor.extract_dominant_colors(
             pixels,
             n_colors,
+            use_mask=(mask is not None),
+            mask=mask,
             return_counts=True
         )
 
@@ -739,6 +914,40 @@ class ColorExtractor:
             })
 
         # Most dominant foreground color
-        palette["primary_color"] = palette["colors"][0]["name"]
+        if palette["colors"]:
+            palette["primary_color"] = palette["colors"][0]["name"]
 
         return palette
+
+    @staticmethod
+    def semantic_primary_color(color_palette: Dict, pattern: str = None) -> str:
+        """
+        Pick the searchable identity color.
+
+        Pixel majority is correct for solid garments, but striped garments often have
+        a light canvas plus darker defining stripes. For search/filtering, promote the
+        first non-light-neutral stripe color; if all stripes are neutral, use the
+        darkest color rather than the light base.
+        """
+        colors = color_palette.get("colors", []) if color_palette else []
+        if not colors:
+            return color_palette.get("primary_color") if color_palette else None
+
+        raw_primary = color_palette.get("primary_color") or colors[0].get("name")
+        if not pattern or "stripe" not in pattern.lower():
+            return raw_primary
+
+        light_neutrals = {
+            "white", "off-white", "cream", "light gray", "light grey",
+            "gray", "grey", "heather grey", "heather gray", "silver",
+        }
+        for color in colors:
+            name = color.get("name")
+            if name and name not in light_neutrals:
+                return name
+
+        def luminance(color_info: Dict) -> float:
+            rgb = color_info.get("rgb", [255, 255, 255])
+            return (0.2126 * rgb[0]) + (0.7152 * rgb[1]) + (0.0722 * rgb[2])
+
+        return min(colors, key=luminance).get("name", raw_primary)

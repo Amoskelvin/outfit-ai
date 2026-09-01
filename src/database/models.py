@@ -37,6 +37,16 @@ class WardrobeItem(Base):
     pattern = Column(String)  # solid, striped, printed, etc.
     formality = Column(String)  # casual, business_casual, formal
     season = Column(String)  # spring, summer, fall, winter, all
+
+    # Advanced attributes
+    sleeve_length = Column(String, nullable=True)  # short sleeve, long sleeve, sleeveless
+    neckline = Column(String, nullable=True)       # crew, v-neck, collar
+    has_logo = Column(Integer, default=0)          # 0 or 1
+    detected_text = Column(JSON, nullable=True)    # List of detected text/logos
+    texture = Column(String, nullable=True)        # smooth, embossed, quilted
+    closure_type = Column(String, nullable=True)   # zipper, buttons, pullover
+    fit = Column(String, nullable=True)            # For pants: skinny, slim, regular
+    length = Column(String, nullable=True)         # For bottoms/coats
     
     # ML embeddings
     embedding = Column(JSON)  # Feature vector from ML model
